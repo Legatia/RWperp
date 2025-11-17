@@ -1,0 +1,15 @@
+[package]
+name = "market-factory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+casper-contract.workspace = true
+casper-types.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "market-factory"
+path = "src/main.rs"

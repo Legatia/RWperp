@@ -1,0 +1,15 @@
+[package]
+name = "settlement"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+casper-contract.workspace = true
+casper-types.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "settlement"
+path = "src/main.rs"

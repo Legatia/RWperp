@@ -1,0 +1,15 @@
+[package]
+name = "oracle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+casper-contract.workspace = true
+casper-types.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "oracle"
+path = "src/main.rs"

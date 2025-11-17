@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "contracts/market-factory",
+    "contracts/position-manager",
+    "contracts/vault",
+    "contracts/oracle",
+    "contracts/settlement"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+casper-contract = "4.0.0"
+casper-types = "4.0.0"
+casper-storage = "1.0.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+panic = "abort"
+overflow-checks = true
+
+[profile.wasm]
+inherits = "release"

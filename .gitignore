@@ -1,0 +1,36 @@
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+*.key
+secret_key*
+.env
+.env.local
+
+# Deployment
+deployed_contracts.json
+deployment_*.log
+
+# Build artifacts
+*.wasm
+*.wasm.optimized
+
+# Logs
+logs/
+*.log
+npm-debug.log*
