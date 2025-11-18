@@ -11,7 +11,7 @@ use casper_contract::{
 };
 use casper_types::{runtime_args, Key, RuntimeArgs, U256, U512, CLValue};
 
-use market_factory::{errors, storage_keys, DailyMarket, MarketConfig, RWAssetType};
+use market_factory::{errors, storage_keys, DailyMarket, ContinuousPerp, FundingRateData, MarketConfig, RWAssetType, SettlementMode};
 
 /// Initialize the market factory contract
 #[no_mangle]
@@ -173,6 +173,291 @@ pub extern "C" fn update_config() {
     storage::write(config_uref, config);
 }
 
+/// Create a new continuous perpetual market for frequently-updating RWAs
+/// Used for assets like Gold, Silver, Oil, S&P500, Nasdaq that update frequently
+#[no_mangle]
+pub extern "C" fn create_continuous_perp() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+    let opening_price: U256 = runtime::get_named_arg("opening_price");
+
+    // Verify caller is admin
+    verify_admin();
+
+    // Convert asset type
+    let asset_type = match asset_type_u8 {
+        0 => RWAssetType::Gold,
+        1 => RWAssetType::Silver,
+        2 => RWAssetType::SP500,
+        3 => RWAssetType::Nasdaq,
+        4 => RWAssetType::Oil,
+        5 => RWAssetType::USHousing,
+        6 => RWAssetType::Platinum,
+        _ => runtime::revert(errors::INVALID_ASSET_TYPE),
+    };
+
+    // Check if perp already exists for this asset
+    let perp_key = format!("{}{}", storage_keys::PERP_PREFIX, asset_type_u8);
+    if runtime::get_key(&perp_key).is_some() {
+        runtime::revert(errors::PERP_ALREADY_EXISTS);
+    }
+
+    // Validate price
+    if opening_price == U256::zero() {
+        runtime::revert(errors::INVALID_PRICE);
+    }
+
+    // Get config
+    let config_uref = runtime::get_key(storage_keys::CONFIG)
+        .unwrap_or_revert()
+        .into_uref()
+        .unwrap_or_revert();
+    let config: MarketConfig = storage::read(config_uref).unwrap_or_revert().unwrap_or_revert();
+
+    // Get current timestamp
+    let now = runtime::get_blocktime();
+
+    // Create new perpetual market
+    let perp = ContinuousPerp {
+        asset_type,
+        created_at: now,
+        current_price: opening_price,
+        index_price: opening_price,
+        mark_price: opening_price,
+        funding_rate: 0,  // Start with 0 funding rate
+        last_funding_time: now,
+        funding_interval: 28800, // 8 hours in seconds
+        total_long_oi: U512::zero(),
+        total_short_oi: U512::zero(),
+        total_long_collateral: U512::zero(),
+        total_short_collateral: U512::zero(),
+        max_leverage: config.max_leverage,
+        is_active: true,
+    };
+
+    // Store perp
+    runtime::put_key(&perp_key, storage::new_uref(perp).into());
+
+    // Initialize funding rate history dictionary
+    let funding_dict_name = format!("{}{}", storage_keys::FUNDING_PREFIX, asset_type_u8);
+    storage::new_dictionary(&funding_dict_name).unwrap_or_revert();
+}
+
+/// Update perpetual market price (called by oracle every 30 seconds)
+#[no_mangle]
+pub extern "C" fn update_perp_price() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+    let new_price: U256 = runtime::get_named_arg("price");
+
+    // Verify caller is oracle contract
+    verify_oracle_contract();
+
+    // Validate price
+    if new_price == U256::zero() {
+        runtime::revert(errors::INVALID_PRICE);
+    }
+
+    // Get perp
+    let perp_key = format!("{}{}", storage_keys::PERP_PREFIX, asset_type_u8);
+    let perp_uref = runtime::get_key(&perp_key)
+        .unwrap_or_revert_with(errors::PERP_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let mut perp: ContinuousPerp = storage::read(perp_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    // Verify perp is active
+    if !perp.is_active {
+        runtime::revert(errors::MARKET_NOT_ACTIVE);
+    }
+
+    // Update prices
+    perp.current_price = new_price;
+    perp.index_price = new_price;
+
+    // Mark price is influenced by platform trading but starts with index price
+    // In practice, this would be calculated based on order book/trades
+    perp.mark_price = new_price;
+
+    storage::write(perp_uref, perp);
+}
+
+/// Calculate funding rate based on price divergence
+/// Formula: funding_rate = (mark_price - index_price) / index_price * funding_coefficient
+/// Positive rate = longs pay shorts, Negative rate = shorts pay longs
+#[no_mangle]
+pub extern "C" fn calculate_funding_rate() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+
+    // Verify caller is authorized (admin or settlement contract)
+    verify_authorized_caller();
+
+    // Get perp
+    let perp_key = format!("{}{}", storage_keys::PERP_PREFIX, asset_type_u8);
+    let perp_uref = runtime::get_key(&perp_key)
+        .unwrap_or_revert_with(errors::PERP_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let perp: ContinuousPerp = storage::read(perp_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    // Calculate premium index: (mark_price - index_price) / index_price * 10000 (basis points)
+    let premium_index = if perp.index_price > U256::zero() {
+        let price_diff = if perp.mark_price > perp.index_price {
+            (perp.mark_price - perp.index_price).as_u128() as i128
+        } else {
+            -((perp.index_price - perp.mark_price).as_u128() as i128)
+        };
+        let index_price_u128 = perp.index_price.as_u128() as i128;
+        (price_diff * 10000) / index_price_u128
+    } else {
+        0
+    };
+
+    // Interest rate component (fixed at 0.01% per 8 hours = 1 basis point)
+    let interest_rate: i64 = 1;
+
+    // Funding rate = (premium_index + interest_rate) / funding_periods_per_day
+    // We have 3 funding periods per day (every 8 hours)
+    let funding_rate: i64 = ((premium_index as i64 + interest_rate) / 3).max(-1000).min(1000); // Cap at ±10%
+
+    // Return funding rate
+    runtime::ret(CLValue::from_t(funding_rate).unwrap_or_revert());
+}
+
+/// Execute funding payments (called every 8 hours)
+/// Transfers funding between longs and shorts based on funding rate
+#[no_mangle]
+pub extern "C" fn pay_funding() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+
+    // Verify caller is authorized (admin or settlement contract)
+    verify_authorized_caller();
+
+    // Get perp
+    let perp_key = format!("{}{}", storage_keys::PERP_PREFIX, asset_type_u8);
+    let perp_uref = runtime::get_key(&perp_key)
+        .unwrap_or_revert_with(errors::PERP_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let mut perp: ContinuousPerp = storage::read(perp_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    // Verify perp is active
+    if !perp.is_active {
+        runtime::revert(errors::MARKET_NOT_ACTIVE);
+    }
+
+    // Check if funding interval has passed
+    let now = runtime::get_blocktime();
+    if now < perp.last_funding_time + perp.funding_interval {
+        runtime::revert(errors::FUNDING_TOO_EARLY);
+    }
+
+    // Calculate funding rate
+    let premium_index = if perp.index_price > U256::zero() {
+        let price_diff = if perp.mark_price > perp.index_price {
+            (perp.mark_price - perp.index_price).as_u128() as i128
+        } else {
+            -((perp.index_price - perp.mark_price).as_u128() as i128)
+        };
+        let index_price_u128 = perp.index_price.as_u128() as i128;
+        (price_diff * 10000) / index_price_u128
+    } else {
+        0
+    };
+
+    let interest_rate: i64 = 1;
+    let funding_rate: i64 = ((premium_index as i64 + interest_rate) / 3).max(-1000).min(1000);
+
+    // Update perp with new funding rate and timestamp
+    perp.funding_rate = funding_rate;
+    perp.last_funding_time = now;
+    storage::write(perp_uref, perp.clone());
+
+    // Store funding rate data for historical tracking
+    let funding_data = FundingRateData {
+        timestamp: now,
+        funding_rate,
+        premium_index: premium_index as i64,
+        interest_rate,
+        long_oi: perp.total_long_oi,
+        short_oi: perp.total_short_oi,
+    };
+
+    let funding_dict_name = format!("{}{}", storage_keys::FUNDING_PREFIX, asset_type_u8);
+    let funding_key = now.to_string();
+    storage::dictionary_put(
+        runtime::get_key(&funding_dict_name).unwrap_or_revert().into_uref().unwrap_or_revert(),
+        &funding_key,
+        funding_data,
+    );
+
+    // NOTE: Actual funding payments to positions are handled by position-manager contract
+    // This function just calculates and stores the funding rate
+    // Position-manager will call get_funding_rate() and apply payments to all open positions
+}
+
+/// Get perpetual market information
+#[no_mangle]
+pub extern "C" fn get_perp() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+
+    let perp_key = format!("{}{}", storage_keys::PERP_PREFIX, asset_type_u8);
+    let perp_uref = runtime::get_key(&perp_key)
+        .unwrap_or_revert_with(errors::PERP_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let perp: ContinuousPerp = storage::read(perp_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    runtime::ret(CLValue::from_t(perp).unwrap_or_revert());
+}
+
+/// Get current funding rate for a perpetual market
+#[no_mangle]
+pub extern "C" fn get_funding_rate() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+
+    let perp_key = format!("{}{}", storage_keys::PERP_PREFIX, asset_type_u8);
+    let perp_uref = runtime::get_key(&perp_key)
+        .unwrap_or_revert_with(errors::PERP_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let perp: ContinuousPerp = storage::read(perp_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    runtime::ret(CLValue::from_t(perp.funding_rate).unwrap_or_revert());
+}
+
+/// Get funding rate history for a perpetual market
+#[no_mangle]
+pub extern "C" fn get_funding_history() {
+    let asset_type_u8: u8 = runtime::get_named_arg("asset_type");
+    let timestamp: u64 = runtime::get_named_arg("timestamp");
+
+    let funding_dict_name = format!("{}{}", storage_keys::FUNDING_PREFIX, asset_type_u8);
+    let funding_uref = runtime::get_key(&funding_dict_name)
+        .unwrap_or_revert_with(errors::PERP_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let funding_key = timestamp.to_string();
+    let funding_data: Option<FundingRateData> = storage::dictionary_get(funding_uref, &funding_key)
+        .unwrap_or_revert();
+
+    runtime::ret(CLValue::from_t(funding_data).unwrap_or_revert());
+}
+
 // Helper functions
 
 fn get_and_increment_market_count() -> u64 {
@@ -241,6 +526,21 @@ fn verify_authorized_caller() {
     let caller = runtime::get_caller();
     if caller != admin.into_account().unwrap_or_revert()
        && caller != settlement_contract.into_account().unwrap_or_revert() {
+        runtime::revert(errors::UNAUTHORIZED);
+    }
+}
+
+fn verify_oracle_contract() {
+    let oracle_uref = runtime::get_key(storage_keys::ORACLE_CONTRACT)
+        .unwrap_or_revert()
+        .into_uref()
+        .unwrap_or_revert();
+
+    let oracle_contract: Key = storage::read(oracle_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    if runtime::get_caller() != oracle_contract.into_account().unwrap_or_revert() {
         runtime::revert(errors::UNAUTHORIZED);
     }
 }

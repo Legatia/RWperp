@@ -11,7 +11,7 @@ use casper_contract::{
 use casper_types::{account::AccountHash, Key, U256, CLValue};
 
 use oracle::{
-    errors, storage_keys, AggregatedPrice, OracleConfig, OracleValidator, PriceSubmission,
+    errors, storage_keys, AggregatedPrice, OracleConfig, OracleValidator, PriceSubmission, RealtimePrice,
 };
 
 /// Initialize the oracle contract
@@ -19,11 +19,16 @@ use oracle::{
 pub extern "C" fn init() {
     let admin: Key = runtime::get_named_arg("admin");
     let settlement_contract: Key = runtime::get_named_arg("settlement_contract");
+    let market_factory_contract: Key = runtime::get_named_arg("market_factory_contract");
 
     runtime::put_key(storage_keys::ADMIN, storage::new_uref(admin).into());
     runtime::put_key(
         storage_keys::SETTLEMENT_CONTRACT,
         storage::new_uref(settlement_contract).into(),
+    );
+    runtime::put_key(
+        storage_keys::MARKET_FACTORY_CONTRACT,
+        storage::new_uref(market_factory_contract).into(),
     );
     runtime::put_key(storage_keys::VALIDATORS_COUNT, storage::new_uref(0u64).into());
 
@@ -273,6 +278,168 @@ pub extern "C" fn update_config() {
     }
 
     storage::write(config_uref, config);
+}
+
+/// Initialize real-time price feed for an asset (used for continuous perps)
+/// Called when creating a continuous perp market
+#[no_mangle]
+pub extern "C" fn init_realtime_price() {
+    verify_authorized();
+
+    let asset_type: u8 = runtime::get_named_arg("asset_type");
+    let initial_price: U256 = runtime::get_named_arg("price");
+
+    // Validate price
+    if initial_price == U256::zero() {
+        runtime::revert(errors::INVALID_PRICE);
+    }
+
+    let config = get_config();
+    let now = runtime::get_blocktime();
+    let caller = runtime::get_caller();
+
+    // Create initial real-time price
+    let realtime_price = RealtimePrice {
+        asset_type,
+        price: initial_price,
+        timestamp: now,
+        update_interval: config.realtime_update_interval,
+        validator: caller,
+        sequence_number: 0,
+    };
+
+    // Store real-time price
+    let realtime_key = format!("{}{}", storage_keys::REALTIME_PRICE_PREFIX, asset_type);
+    runtime::put_key(&realtime_key, storage::new_uref(realtime_price).into());
+
+    // Initialize sequence number
+    let seq_key = format!("{}{}", storage_keys::PRICE_SEQUENCE_PREFIX, asset_type);
+    runtime::put_key(&seq_key, storage::new_uref(0u64).into());
+}
+
+/// Update real-time price for continuous perps (called every 30 seconds by validators)
+/// This provides streaming price updates for frequently-changing RWAs
+#[no_mangle]
+pub extern "C" fn update_realtime_price() {
+    let asset_type: u8 = runtime::get_named_arg("asset_type");
+    let new_price: U256 = runtime::get_named_arg("price");
+
+    let validator_address = runtime::get_caller();
+
+    // Verify validator is registered and active
+    let validator_key = format!("{}{:?}", storage_keys::VALIDATORS_PREFIX, validator_address);
+    let validator_uref = runtime::get_key(&validator_key)
+        .unwrap_or_revert_with(errors::VALIDATOR_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let validator: OracleValidator = storage::read(validator_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    if !validator.is_active {
+        runtime::revert(errors::UNAUTHORIZED);
+    }
+
+    // Validate price
+    if new_price == U256::zero() {
+        runtime::revert(errors::INVALID_PRICE);
+    }
+
+    // Get config
+    let config = get_config();
+
+    // Get current real-time price
+    let realtime_key = format!("{}{}", storage_keys::REALTIME_PRICE_PREFIX, asset_type);
+    let realtime_uref = runtime::get_key(&realtime_key)
+        .unwrap_or_revert_with(errors::REALTIME_PRICE_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let mut current_price: RealtimePrice = storage::read(realtime_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    // Check update interval (prevent too frequent updates)
+    let now = runtime::get_blocktime();
+    if now < current_price.timestamp + config.realtime_update_interval {
+        runtime::revert(errors::UPDATE_TOO_FREQUENT);
+    }
+
+    // Validate price deviation (reject if price changed too much)
+    let max_deviation = (current_price.price * U256::from(config.realtime_max_deviation_bps)) / U256::from(10000);
+    let price_diff = if new_price > current_price.price {
+        new_price - current_price.price
+    } else {
+        current_price.price - new_price
+    };
+
+    if price_diff > max_deviation {
+        runtime::revert(errors::PRICE_DEVIATION_TOO_HIGH);
+    }
+
+    // Increment sequence number
+    let seq_key = format!("{}{}", storage_keys::PRICE_SEQUENCE_PREFIX, asset_type);
+    let seq_uref = runtime::get_key(&seq_key)
+        .unwrap_or_revert()
+        .into_uref()
+        .unwrap_or_revert();
+    let current_seq: u64 = storage::read(seq_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+    let new_seq = current_seq + 1;
+    storage::write(seq_uref, new_seq);
+
+    // Update price
+    current_price.price = new_price;
+    current_price.timestamp = now;
+    current_price.validator = validator_address;
+    current_price.sequence_number = new_seq;
+
+    storage::write(realtime_uref, current_price);
+
+    runtime::ret(CLValue::from_t(true).unwrap_or_revert());
+}
+
+/// Get latest real-time price (called by market-factory for continuous perps)
+#[no_mangle]
+pub extern "C" fn get_realtime_price() {
+    let asset_type: u8 = runtime::get_named_arg("asset_type");
+
+    let realtime_key = format!("{}{}", storage_keys::REALTIME_PRICE_PREFIX, asset_type);
+    let realtime_uref = runtime::get_key(&realtime_key)
+        .unwrap_or_revert_with(errors::REALTIME_PRICE_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let realtime_price: RealtimePrice = storage::read(realtime_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    runtime::ret(CLValue::from_t(realtime_price).unwrap_or_revert());
+}
+
+/// Get price history for a range (for charting/analytics)
+#[no_mangle]
+pub extern "C" fn get_price_history() {
+    let asset_type: u8 = runtime::get_named_arg("asset_type");
+    let start_timestamp: u64 = runtime::get_named_arg("start_timestamp");
+    let end_timestamp: u64 = runtime::get_named_arg("end_timestamp");
+
+    // In production, this would query historical price data from storage
+    // For now, return current price as placeholder
+    let realtime_key = format!("{}{}", storage_keys::REALTIME_PRICE_PREFIX, asset_type);
+    let realtime_uref = runtime::get_key(&realtime_key)
+        .unwrap_or_revert_with(errors::REALTIME_PRICE_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let realtime_price: RealtimePrice = storage::read(realtime_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    // Return current price (in production, would return array of historical prices)
+    runtime::ret(CLValue::from_t(realtime_price).unwrap_or_revert());
 }
 
 // Helper functions
