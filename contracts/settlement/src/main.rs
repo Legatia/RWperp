@@ -10,7 +10,7 @@ use casper_contract::{
 };
 use casper_types::{runtime_args, Key, RuntimeArgs, U256, U512, CLValue};
 
-use settlement::{errors, storage_keys, MarketSettlement, SettlementConfig};
+use settlement::{errors, storage_keys, MarketSettlement, SettlementConfig, SettlementMode};
 
 /// Initialize the settlement contract
 #[no_mangle]
@@ -35,6 +35,7 @@ pub extern "C" fn init() {
 
 /// Trigger daily settlement for a specific market
 /// This is the main settlement function called daily at 00:00 UTC
+/// NOTE: This only settles Daily markets. Continuous perps use funding rates instead.
 #[no_mangle]
 pub extern "C" fn settle_market() {
     // Can be called by admin or automatically by keeper/cron
@@ -46,6 +47,22 @@ pub extern "C" fn settle_market() {
 
     // Get settlement config
     let config = get_config();
+
+    // Check market settlement mode
+    let market_factory_key = get_market_factory_contract();
+    let settlement_mode_u8: u8 = runtime::call_contract(
+        market_factory_key.into_hash().unwrap_or_revert(),
+        "get_market_settlement_mode",
+        runtime_args! {
+            "market_key" => market_key.clone(),
+        },
+    );
+    let settlement_mode = SettlementMode::from(settlement_mode_u8);
+
+    // Continuous perps should NOT be settled - they use funding rates instead
+    if settlement_mode == SettlementMode::Continuous {
+        runtime::revert(errors::CANNOT_SETTLE_CONTINUOUS_PERP);
+    }
 
     // Step 1: Get aggregated price from oracle
     let oracle_key = get_oracle_contract();
@@ -84,6 +101,7 @@ pub extern "C" fn settle_market() {
     let market_settlement = MarketSettlement {
         market_key: market_key.clone(),
         asset_type,
+        settlement_mode,
         settlement_price,
         total_positions: 0, // TODO: Get from position manager
         total_long_pnl: U512::zero(),
@@ -104,22 +122,26 @@ pub extern "C" fn settle_market() {
     // Update last settlement timestamp
     update_last_settlement(runtime::get_blocktime());
 
-    // Step 5: Create new market for next day
-    let _: u64 = runtime::call_contract(
-        market_factory_key.into_hash().unwrap_or_revert(),
-        "create_daily_market",
-        runtime_args! {
-            "asset_type" => asset_type,
-            "opening_price" => settlement_price,  // Today's close = tomorrow's open
-            "market_date" => target_timestamp + 86400,  // Next day
-        },
-    );
+    // Step 5: Create new market for next day (ONLY for Daily markets)
+    // Continuous perps run indefinitely and don't need new markets
+    if settlement_mode == SettlementMode::Daily {
+        let _: u64 = runtime::call_contract(
+            market_factory_key.into_hash().unwrap_or_revert(),
+            "create_daily_market",
+            runtime_args! {
+                "asset_type" => asset_type,
+                "opening_price" => settlement_price,  // Today's close = tomorrow's open
+                "market_date" => target_timestamp + 86400,  // Next day
+            },
+        );
+    }
 
     runtime::ret(CLValue::from_t(settlement_price).unwrap_or_revert());
 }
 
 /// Settle all active markets (called daily by keeper)
-/// This function settles all markets in one transaction
+/// This function settles all Daily markets in one transaction
+/// NOTE: Continuous perps are automatically skipped (they use funding rates)
 #[no_mangle]
 pub extern "C" fn settle_all_markets() {
     verify_authorized();
@@ -137,13 +159,33 @@ pub extern "C" fn settle_all_markets() {
         runtime::revert(errors::SETTLEMENT_TOO_EARLY);
     }
 
-    // Settle each market
+    // Get market factory to check settlement modes
+    let market_factory_key = get_market_factory_contract();
+
+    // Settle each market (skip continuous perps)
     let mut settled_count = 0u64;
+    let mut skipped_count = 0u64;
 
     for (i, market_key) in market_keys.iter().enumerate() {
         let asset_type = asset_types[i];
 
-        // Call settle_market for each
+        // Check if this is a Daily market or Continuous perp
+        let settlement_mode_u8: u8 = runtime::call_contract(
+            market_factory_key.into_hash().unwrap_or_revert(),
+            "get_market_settlement_mode",
+            runtime_args! {
+                "market_key" => market_key.clone(),
+            },
+        );
+        let settlement_mode = SettlementMode::from(settlement_mode_u8);
+
+        // Skip continuous perps - they use funding rates instead
+        if settlement_mode == SettlementMode::Continuous {
+            skipped_count += 1;
+            continue;
+        }
+
+        // Call settle_market for Daily markets
         let _: U256 = runtime::call_contract(
             runtime::get_caller().into_hash().unwrap_or_revert(), // Self-call
             "settle_market",

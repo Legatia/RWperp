@@ -5,6 +5,26 @@ extern crate alloc;
 use alloc::vec::Vec;
 use casper_types::{U256, U512};
 
+/// Settlement mode for markets (must match market-factory)
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettlementMode {
+    Daily = 0,       // Daily settlement at 00:00 UTC
+    Continuous = 1,  // Perpetual with funding rates (no settlement)
+    Triggered = 2,   // Event-based settlement (future)
+}
+
+impl From<u8> for SettlementMode {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => SettlementMode::Daily,
+            1 => SettlementMode::Continuous,
+            2 => SettlementMode::Triggered,
+            _ => SettlementMode::Daily,
+        }
+    }
+}
+
 /// Settlement result for a single position
 pub struct PositionSettlement {
     pub position_id: u64,
@@ -19,6 +39,7 @@ pub struct PositionSettlement {
 pub struct MarketSettlement {
     pub market_key: alloc::string::String,
     pub asset_type: u8,
+    pub settlement_mode: SettlementMode,
     pub settlement_price: U256,
     pub total_positions: u64,
     pub total_long_pnl: U512,
@@ -66,4 +87,5 @@ pub mod errors {
     pub const ORACLE_PRICE_NOT_READY: u16 = 403;
     pub const MARKET_NOT_FOUND: u16 = 404;
     pub const SETTLEMENT_FAILED: u16 = 405;
+    pub const CANNOT_SETTLE_CONTINUOUS_PERP: u16 = 406;
 }

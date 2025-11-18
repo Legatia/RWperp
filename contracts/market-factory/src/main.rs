@@ -458,6 +458,22 @@ pub extern "C" fn get_funding_history() {
     runtime::ret(CLValue::from_t(funding_data).unwrap_or_revert());
 }
 
+/// Get settlement mode for a market (used by settlement contract)
+/// Returns: 0 = Daily, 1 = Continuous, 2 = Triggered
+#[no_mangle]
+pub extern "C" fn get_market_settlement_mode() {
+    let market_key: alloc::string::String = runtime::get_named_arg("market_key");
+
+    // Check if this is a continuous perp (format: "perp_{asset_type}")
+    if market_key.starts_with("perp_") {
+        // This is a continuous perp
+        runtime::ret(CLValue::from_t(SettlementMode::Continuous as u8).unwrap_or_revert());
+    } else {
+        // This is a daily market (format: "market_{asset_type}_{date}")
+        runtime::ret(CLValue::from_t(SettlementMode::Daily as u8).unwrap_or_revert());
+    }
+}
+
 // Helper functions
 
 fn get_and_increment_market_count() -> u64 {
