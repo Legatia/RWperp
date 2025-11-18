@@ -18,16 +18,21 @@ export default function HomePage() {
               <span className="text-sm font-semibold">Built on Casper Network 2.0</span>
             </div>
             <h1 className="text-5xl sm:text-7xl font-bold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-white to-purple-200">
-              Predict Real World Assets
+              Trade Real World Assets
             </h1>
             <p className="text-xl sm:text-2xl mb-8 text-purple-100 max-w-2xl mx-auto">
-              Trade predictions on stocks, commodities, real estate with up to <span className="font-bold text-yellow-300">10x leverage</span>. Daily-settled markets with secure oracles.
+              Daily markets OR continuous perps for stocks, commodities, real estate with <span className="font-bold text-yellow-300">10x leverage</span>. Hybrid settlement for every asset class.
             </p>
             <div className="flex flex-col sm:flex-row gap-4 justify-center">
-              <Link href="/markets">
+              <Link href="/perps">
                 <Button size="lg" className="gradient-primary text-white px-8 py-6 text-lg group">
-                  Explore Markets
+                  Trade Perpetuals
                   <ArrowRight className="ml-2 h-5 w-5 group-hover:translate-x-1 transition-transform" />
+                </Button>
+              </Link>
+              <Link href="/markets">
+                <Button size="lg" variant="outline" className="bg-white/10 border-white/30 text-white hover:bg-white/20 px-8 py-6 text-lg">
+                  Daily Markets
                 </Button>
               </Link>
               <Link href="/portfolio">
@@ -56,7 +61,7 @@ export default function HomePage() {
         <div className="container mx-auto px-4">
           <h2 className="text-3xl sm:text-4xl font-bold text-center mb-4">Why RWperp?</h2>
           <p className="text-muted-foreground text-center mb-16 max-w-2xl mx-auto">
-            The first daily-settled prediction market for real-world assets on Casper Network
+            Hybrid settlement system: Daily markets for slow-moving assets, continuous perps for fast-moving RWAs
           </p>
 
           <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8 max-w-6xl mx-auto">
@@ -64,9 +69,9 @@ export default function HomePage() {
               <div className="w-12 h-12 rounded-lg gradient-primary flex items-center justify-center mb-4">
                 <Clock className="h-6 w-6 text-white" />
               </div>
-              <h3 className="text-xl font-semibold mb-2">Daily Settlement</h3>
+              <h3 className="text-xl font-semibold mb-2">Hybrid Settlement</h3>
               <p className="text-muted-foreground">
-                Markets settle every 24 hours at 00:00 UTC. No flash crash liquidations, just clean daily PnL.
+                Daily settlement (00:00 UTC) OR continuous perps with 8-hour funding rates. Choose the right model for each asset.
               </p>
             </Card>
 
@@ -94,9 +99,9 @@ export default function HomePage() {
               <div className="w-12 h-12 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center mb-4">
                 <Zap className="h-6 w-6 text-white" />
               </div>
-              <h3 className="text-xl font-semibold mb-2">Low Gas Costs</h3>
+              <h3 className="text-xl font-semibold mb-2">Real-Time Oracle</h3>
               <p className="text-muted-foreground">
-                Batched daily settlements and once-per-day oracle updates keep costs minimal on Casper.
+                30-second price updates for perpetuals, daily batch aggregation for slow assets. Best of both worlds on Casper.
               </p>
             </Card>
 

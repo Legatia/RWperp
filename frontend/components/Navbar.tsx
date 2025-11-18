@@ -31,7 +31,13 @@ export function Navbar() {
               href="/markets"
               className="text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
             >
-              Markets
+              Daily Markets
+            </Link>
+            <Link
+              href="/perps"
+              className="text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Perpetuals
             </Link>
             <Link
               href="/portfolio"
@@ -89,7 +95,14 @@ export function Navbar() {
               className="block py-2 text-sm font-medium"
               onClick={() => setMobileMenuOpen(false)}
             >
-              Markets
+              Daily Markets
+            </Link>
+            <Link
+              href="/perps"
+              className="block py-2 text-sm font-medium"
+              onClick={() => setMobileMenuOpen(false)}
+            >
+              Perpetuals
             </Link>
             <Link
               href="/portfolio"
