@@ -21,6 +21,7 @@ const governanceRouter = require('./routes/governance');
 const stakingRouter = require('./routes/staking');
 const statsRouter = require('./routes/stats');
 const socialRouter = require('./routes/social');
+const perpsRouter = require('./routes/perps');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -64,6 +65,7 @@ app.use('/api/governance', governanceRouter);
 app.use('/api/staking', stakingRouter);
 app.use('/api/stats', statsRouter);
 app.use('/api/social', socialRouter);
+app.use('/api/perps', perpsRouter);
 
 // 404 handler
 app.use((req, res) => {
