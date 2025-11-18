@@ -12,7 +12,7 @@ use casper_contract::{
 };
 use casper_types::{account::AccountHash, runtime_args, Key, RuntimeArgs, U256, U512, CLValue};
 
-use position_manager::{errors, storage_keys, Position, PositionSide};
+use position_manager::{errors, storage_keys, Position, PositionSide, SettlementMode};
 
 /// Initialize the position manager contract
 #[no_mangle]
@@ -32,6 +32,7 @@ pub extern "C" fn init() {
 pub extern "C" fn open_position() {
     let market_key: alloc::string::String = runtime::get_named_arg("market_key");
     let side_u8: u8 = runtime::get_named_arg("side"); // 0 = Long, 1 = Short
+    let settlement_mode_u8: u8 = runtime::get_named_arg("settlement_mode"); // 0 = Daily, 1 = Continuous
     let collateral: U512 = runtime::get_named_arg("collateral");
     let leverage: u8 = runtime::get_named_arg("leverage");
     let entry_price: U256 = runtime::get_named_arg("entry_price");
@@ -53,6 +54,12 @@ pub extern "C" fn open_position() {
         _ => runtime::revert(errors::INVALID_LEVERAGE), // Using as general invalid param
     };
 
+    let settlement_mode = match settlement_mode_u8 {
+        0 => SettlementMode::Daily,
+        1 => SettlementMode::Continuous,
+        _ => runtime::revert(errors::INVALID_LEVERAGE), // Using as general invalid param
+    };
+
     // Calculate effective size
     let effective_size = collateral * U512::from(leverage);
 
@@ -60,17 +67,23 @@ pub extern "C" fn open_position() {
     // TODO: Check position size limits (max 5% of pool)
     // TODO: Lock collateral in vault contract
 
+    let now = runtime::get_blocktime();
+
     // Create position
     let position = Position {
         user,
         market_key: market_key.clone(),
         side,
+        settlement_mode,
         collateral,
         leverage,
         effective_size,
         entry_price,
-        timestamp: runtime::get_blocktime(),
+        timestamp: now,
         is_closed: false,
+        accumulated_funding: 0,
+        last_funding_time: now,
+        funding_payments_count: 0,
     };
 
     // Store position
@@ -85,6 +98,13 @@ pub extern "C" fn open_position() {
     // Track market positions
     let market_positions_key = format!("{}{}", storage_keys::MARKET_POSITIONS_PREFIX, market_key);
     add_to_market_positions(market_positions_key, position_id);
+
+    // For continuous perps, also track by asset type
+    if settlement_mode as u8 == SettlementMode::Continuous as u8 {
+        let asset_type: u8 = runtime::get_named_arg("asset_type");
+        let perp_positions_key = format!("{}{}", storage_keys::PERP_POSITIONS_PREFIX, asset_type);
+        add_to_perp_positions(perp_positions_key, position_id);
+    }
 
     // Return position ID and liquidation price
     let liquidation_price = position.get_liquidation_price();
@@ -159,7 +179,7 @@ pub extern "C" fn get_position() {
     runtime::ret(CLValue::from_t(position).unwrap_or_revert());
 }
 
-/// Calculate current PnL for a position
+/// Calculate current PnL for a position (includes funding for continuous perps)
 #[no_mangle]
 pub extern "C" fn calculate_position_pnl() {
     let position_id: u64 = runtime::get_named_arg("position_id");
@@ -175,12 +195,12 @@ pub extern "C" fn calculate_position_pnl() {
         .unwrap_or_revert()
         .unwrap_or_revert();
 
-    let (pnl, is_profit) = position.calculate_pnl(current_price);
+    let (pnl, is_profit) = position.calculate_pnl_with_funding(current_price);
     let is_liquidated = position.is_liquidated(current_price);
     let liquidation_price = position.get_liquidation_price();
 
     runtime::ret(
-        CLValue::from_t((pnl, is_profit, is_liquidated, liquidation_price)).unwrap_or_revert(),
+        CLValue::from_t((pnl, is_profit, is_liquidated, liquidation_price, position.accumulated_funding)).unwrap_or_revert(),
     );
 }
 
@@ -204,6 +224,80 @@ pub extern "C" fn settle_market_positions() {
 
     // For now, return success
     runtime::ret(CLValue::from_t(true).unwrap_or_revert());
+}
+
+/// Apply funding payment to a single position (for continuous perps)
+/// Called by settlement contract every 8 hours
+#[no_mangle]
+pub extern "C" fn apply_funding_to_position() {
+    let position_id: u64 = runtime::get_named_arg("position_id");
+    let funding_rate: i64 = runtime::get_named_arg("funding_rate");
+
+    // TODO: Verify caller is authorized (market_factory or admin)
+
+    let position_key = format!("{}{}", storage_keys::POSITION_PREFIX, position_id);
+    let position_uref = runtime::get_key(&position_key)
+        .unwrap_or_revert_with(errors::POSITION_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let mut position: Position = storage::read(position_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    let now = runtime::get_blocktime();
+    position.apply_funding(funding_rate, now);
+
+    storage::write(position_uref, position);
+
+    runtime::ret(CLValue::from_t(true).unwrap_or_revert());
+}
+
+/// Apply funding to all positions for a perpetual market (called every 8 hours)
+/// This is called by the settlement contract after funding rate is calculated
+#[no_mangle]
+pub extern "C" fn apply_funding_batch() {
+    let asset_type: u8 = runtime::get_named_arg("asset_type");
+    let funding_rate: i64 = runtime::get_named_arg("funding_rate");
+
+    // TODO: Verify caller is market_factory or admin
+
+    // Get all continuous perp positions for this asset
+    let perp_positions_key = format!("{}{}", storage_keys::PERP_POSITIONS_PREFIX, asset_type);
+
+    // TODO: In production, iterate through all positions efficiently
+    // For now, this would be called for each position individually
+    // or use dictionaries to batch process
+
+    let now = runtime::get_blocktime();
+
+    // Return success
+    runtime::ret(CLValue::from_t((true, now)).unwrap_or_revert());
+}
+
+/// Get funding statistics for a position
+#[no_mangle]
+pub extern "C" fn get_position_funding() {
+    let position_id: u64 = runtime::get_named_arg("position_id");
+
+    let position_key = format!("{}{}", storage_keys::POSITION_PREFIX, position_id);
+    let position_uref = runtime::get_key(&position_key)
+        .unwrap_or_revert_with(errors::POSITION_NOT_FOUND)
+        .into_uref()
+        .unwrap_or_revert();
+
+    let position: Position = storage::read(position_uref)
+        .unwrap_or_revert()
+        .unwrap_or_revert();
+
+    runtime::ret(
+        CLValue::from_t((
+            position.accumulated_funding,
+            position.last_funding_time,
+            position.funding_payments_count,
+        ))
+        .unwrap_or_revert(),
+    );
 }
 
 // Helper functions
@@ -233,6 +327,13 @@ fn add_to_market_positions(market_positions_key: alloc::string::String, position
     // Simple implementation: store as new key
     // In production, use a dictionary or vector
     let key = format!("{}_{}", market_positions_key, position_id);
+    runtime::put_key(&key, storage::new_uref(position_id).into());
+}
+
+fn add_to_perp_positions(perp_positions_key: alloc::string::String, position_id: u64) {
+    // Track continuous perp positions by asset type
+    // In production, use a dictionary or vector
+    let key = format!("{}_{}", perp_positions_key, position_id);
     runtime::put_key(&key, storage::new_uref(position_id).into());
 }
 
